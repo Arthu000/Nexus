@@ -4,7 +4,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>NEXUS — Crypto Dashboard</title>
+<!-- Prevent white flash before CSS loads -->
+<style>html,body{background:#080b0f!important;color:#e8f0fe!important;}</style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -967,44 +971,65 @@ function timeNow() {
 }
 
 // ═══════════════════════════════════════════════════
-//  CORS PROXY FETCH — multi-proxy with auto-fallback
+//  FETCH — Direct CoinGecko + CORS proxy fallbacks
 // ═══════════════════════════════════════════════════
 
-// Proxies tried in order — if one fails, next is used automatically
-const PROXIES = [
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://thingproxy.freeboard.io/fetch/${url}`,
-  url => url, // direct last resort
-];
+// Strategy: try direct first (works on most browsers), then proxies
+async function tryFetch(url, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data?.status?.error_code) throw new Error(`CoinGecko ${data.status.error_code}: ${data.status.error_message}`);
+    return data;
+  } catch(e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
 
-async function fetchWithProxy(targetUrl) {
+async function fetchWithFallback(cgUrl) {
+  const attempts = [
+    // 1. Direct (works if browser allows, e.g. CoinGecko has CORS open for public API)
+    () => tryFetch(cgUrl),
+    // 2. corsproxy.io
+    () => tryFetch(`https://corsproxy.io/?${encodeURIComponent(cgUrl)}`),
+    // 3. allorigins raw
+    () => tryFetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(cgUrl)}`),
+    // 4. allorigins get (wrapped in {contents})
+    async () => {
+      const d = await tryFetch(`https://api.allorigins.win/get?url=${encodeURIComponent(cgUrl)}`);
+      return JSON.parse(d.contents);
+    },
+    // 5. jsonp.afeld.me
+    () => tryFetch(`https://jsonp.afeld.me/?url=${encodeURIComponent(cgUrl)}`),
+  ];
+
   let lastErr;
-  for (const proxy of PROXIES) {
+  for (let i = 0; i < attempts.length; i++) {
     try {
-      const proxied = proxy(targetUrl);
-      const res = await fetch(proxied, { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      // CoinGecko rate-limit returns a status object
-      if (data && data.status && data.status.error_code) throw new Error(`CoinGecko: ${data.status.error_message}`);
+      const data = await attempts[i]();
+      if (i > 0) console.log(`✓ Proxy #${i} succeeded`);
       return data;
     } catch(e) {
       lastErr = e;
-      console.warn(`Proxy failed (${proxy(targetUrl).slice(0,40)}…):`, e.message);
+      console.warn(`Attempt ${i} failed:`, e.message);
     }
   }
-  throw new Error(`Tous les proxies ont échoué — ${lastErr?.message}`);
+  throw new Error(`Toutes les tentatives ont échoué. Dernière erreur: ${lastErr?.message}`);
 }
 
 async function fetchMarketData() {
   const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${TOP_COINS.join(',')}&order=market_cap_desc&per_page=20&page=1&sparkline=true&price_change_percentage=24h,7d`;
-  return fetchWithProxy(url);
+  return fetchWithFallback(url);
 }
 
 async function fetchChartData(coinId, days) {
   const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`;
-  return fetchWithProxy(url);
+  return fetchWithFallback(url);
 }
 
 // ═══════════════════════════════════════════════════
